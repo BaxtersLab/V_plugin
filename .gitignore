@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# IDE
+.vscode/
+.idea/
+
+# Runtime artifacts (when used as a plugin)
+data_log/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,9 @@
+# V Plugin runtime dependencies
+# All are also dependencies of SOC Ultralight itself, so on a normal install
+# these will already be satisfied. Listed here for standalone clarity.
+
+requests>=2.28
+Pillow>=9.0
+
+# Optional: faster screen capture. PIL.ImageGrab is used as a fallback.
+mss>=9.0
