@@ -23,6 +23,7 @@ import base64
 import io
 import json as _json
 import re
+import time
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +46,48 @@ except ImportError:
 
 from PIL import ImageGrab as _PILGrab
 
+# pyautogui is optional — action execution degrades gracefully without it
+try:
+    import pyautogui as _pag
+    _pag.FAILSAFE = True   # move mouse to top-left corner to abort any sequence
+    _pag.PAUSE    = 0.05
+    _PYAUTOGUI_OK = True
+except ImportError:
+    _pag = None
+    _PYAUTOGUI_OK = False
+
+# ── Action block parsing ──────────────────────────────────────────────────────
+# Agent4 can emit a "To Actions … end message now" block to control the desktop.
+# Blocks coexist with routing blocks — actions execute first, then route.
+_ACT_BLOCK_RE  = re.compile(
+    r"(?i)\bto\s+actions?\b(.+?)end\s+message\s+now", re.DOTALL)
+_ACT_CLICK_RE  = re.compile(r"(?i)^CLICK\s*\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)")
+_ACT_RCLICK_RE = re.compile(r"(?i)^RCLICK\s*\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)")
+_ACT_MOVE_RE   = re.compile(r"(?i)^MOVE\s*\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)")
+_ACT_TYPE_RE   = re.compile(r'(?i)^TYPE\s*\((.+)\)\s*$')
+_ACT_HOTKEY_RE = re.compile(r'(?i)^HOTKEY\s*\((.+)\)\s*$')
+_ACT_SCDN_RE   = re.compile(r"(?i)^SCROLL_?DOWN\s*\(\s*(\d+)(?:\s*,\s*(-?\d+)\s*,\s*(-?\d+))?\s*\)")
+_ACT_SCUP_RE   = re.compile(r"(?i)^SCROLL_?UP\s*\(\s*(\d+)(?:\s*,\s*(-?\d+)\s*,\s*(-?\d+))?\s*\)")
+_ACT_WAIT_RE   = re.compile(r"(?i)^WAIT\s*\(\s*([0-9.]+)\s*\)")
+_ACT_SHOT_RE   = re.compile(r"(?i)^SCREENSHOT\s*\(\s*\)")
+_ACT_REASON_RE = re.compile(r'(?i)^REASON\s*\((.+)\)\s*$')
+
+# Windows shell classes that are hard-blocked (taskbar, start menu)
+_TASKBAR_CLASSES = frozenset({
+    "Shell_TrayWnd",
+    "Windows.UI.Core.CoreWindow",
+    "DV2ControlHost",
+    "StartMenuExperienceHost",
+    "LauncherTipWnd",
+})
+# Windows shell classes that are the bare desktop (require permission)
+_DESKTOP_CLASSES = frozenset({
+    "Progman",
+    "WorkerW",
+    "SHELLDLL_DefView",
+    "SysListView32",
+})
+
 
 # ── Defaults (overridable via config) ─────────────────────────────────────────
 DEFAULTS = {
@@ -59,17 +102,46 @@ DEFAULTS = {
 # the SOC routing protocol. Model-agnostic — works with any instruction-tuned
 # vision GGUF (qwen2-vl, llava, minicpm-v, etc.).
 AGENT4_SYSTEM_PROMPT = (
-    "You are Agent 4 — the visual intelligence agent in a 4-agent system.\n"
-    "You can see the screen live. When sent on a mission by another agent, "
-    "observe what is visible, analyse it carefully, and report your findings.\n\n"
-    "ROUTING FORMAT — use this when sending results back into the agent loop:\n"
+    "You are Agent 4 — the visual intelligence and desktop-control agent in a multi-agent system.\n"
+    "You can see the screen live and issue actions to control the mouse and keyboard.\n\n"
+
+    "ROUTING FORMAT — send findings back into the agent loop:\n"
     "  To Agent1\n"
     "  [your findings or instructions]\n"
     "  end message now\n\n"
     "Use To Agent1 (planner/context), To Agent2 (builder/implementer), or "
-    "To Agent3 (orchestrator/auditor) depending on who needs the information.\n"
+    "To Agent3 (orchestrator/auditor) depending on who needs the information.\n\n"
+
+    "ACTION FORMAT — control the desktop:\n"
+    "  To Actions\n"
+    "  REASON(one sentence explaining why this action is needed)\n"
+    "  CLICK(x, y)          — left-click at screen coordinates\n"
+    "  RCLICK(x, y)         — right-click at screen coordinates\n"
+    "  MOVE(x, y)           — move mouse without clicking\n"
+    "  TYPE(text)           — type text at current focus\n"
+    "  HOTKEY(ctrl, c)      — press key combination (comma-separated)\n"
+    "  SCROLL_DOWN(n)           — scroll down n clicks at current mouse position\n"
+    "  SCROLL_DOWN(n, x, y)     — scroll down n clicks at screen coordinate (x,y)\n"
+    "  SCROLL_UP(n)             — scroll up n clicks at current mouse position\n"
+    "  SCROLL_UP(n, x, y)       — scroll up n clicks at screen coordinate (x,y)\n"
+    "  SCREENSHOT()         — capture screen and attach to your next reply\n"
+    "  WAIT(seconds)        — pause (max 10s)\n"
+    "  end message now\n\n"
+
+    "SANDBOX RULES — you must follow these exactly:\n"
+    "  1. Always include REASON(...) before any CLICK or RCLICK that targets the desktop, "
+    "files, folders, or icons. The user will see this reason in an approval dialog.\n"
+    "  2. NEVER attempt to click the Windows taskbar, Start button, or system tray — "
+    "these are hard off-limits and will be blocked automatically.\n"
+    "  3. Clicks inside application windows (agent panels, browsers, editors) do not "
+    "require special permission but REASON is still good practice.\n"
+    "  4. If you are unsure whether a coordinate is safe, use SCREENSHOT() first to "
+    "verify what is visible before acting.\n\n"
+
+    "Action and routing blocks can both appear in a single response — "
+    "actions execute first, then the routing block is dispatched.\n\n"
     "If the user is talking to you directly, respond conversationally — "
-    "no routing format needed unless you want to dispatch to another agent."
+    "no special format needed unless you want to act or dispatch."
 )
 
 
@@ -124,7 +196,7 @@ class DataLogger:
             image: Image.Image | None, action: str,
             outcome: str = "", inference_ms: float = 0.0,
             extra: dict | None = None):
-        """Write one entry. action: 'chat'|'mission'|'route'|'error'.
+        """Write one entry. action: 'chat'|'mission'|'observation'|'actions'|'error'.
         outcome (when action=='route'): 'success'|'fail'."""
         self._seq += 1
         img_path = ""
@@ -155,6 +227,126 @@ class DataLogger:
                 f.write(_json.dumps(entry) + "\n")
         except Exception:
             pass
+
+
+# ── Permission gate ───────────────────────────────────────────────────────────
+class _PermissionGate:
+    """Modal permission dialog for desktop-scope actions.
+
+    Background threads call ask() and block until the user responds.
+    Auto-denies after TIMEOUT seconds so a hallucinating model cannot hang
+    the session indefinitely.
+    """
+    TIMEOUT = 60
+
+    BG     = "#1e1e1e"
+    BG2    = "#2d2d2d"
+    FG     = "#d4d4d4"
+    ORANGE = "#ce9178"
+    RED    = "#f44747"
+    GREEN  = "#4ec9b0"
+
+    def __init__(self, parent: tk.Toplevel):
+        self._parent  = parent
+        self._event   = threading.Event()
+        self._result  = False
+        self._win: tk.Toplevel | None = None
+
+    def ask(self, action_desc: str, reason: str) -> bool:
+        """Show gate and block until user allows or denies. Returns True = allowed."""
+        self._event.clear()
+        self._result = False
+        self._parent.after(0, lambda: self._build(action_desc, reason))
+        granted = self._event.wait(timeout=self.TIMEOUT)
+        return self._result if granted else False
+
+    def _build(self, action_desc: str, reason: str):
+        w = tk.Toplevel(self._parent)
+        w.title("Agent 4 — Action Permission Required")
+        w.configure(bg=self.BG)
+        w.geometry("440x230")
+        w.attributes("-topmost", True)
+        w.resizable(False, False)
+        w.protocol("WM_DELETE_WINDOW", self._deny)
+        self._win = w
+
+        tk.Label(w, text="⚠  Agent 4 is requesting desktop access",
+                 bg=self.BG, fg=self.ORANGE,
+                 font=("Segoe UI", 10, "bold")).pack(pady=(14, 6))
+
+        tk.Label(w, text=action_desc,
+                 bg=self.BG2, fg=self.FG,
+                 font=("Consolas", 9), wraplength=400,
+                 relief="flat", padx=8, pady=4).pack(fill="x", padx=16)
+
+        tk.Label(w, text=reason or "No reason provided.",
+                 bg=self.BG, fg="#aaaaaa",
+                 font=("Segoe UI", 8, "italic"),
+                 wraplength=400).pack(pady=(6, 10))
+
+        btn_row = tk.Frame(w, bg=self.BG)
+        btn_row.pack()
+        tk.Button(btn_row, text="  Allow  ", command=self._allow,
+                  bg="#1a3d1a", fg=self.GREEN,
+                  font=("Segoe UI", 9, "bold"), relief="flat",
+                  cursor="hand2", padx=14, pady=5).pack(side="left", padx=(0, 14))
+        tk.Button(btn_row, text="  Deny  ", command=self._deny,
+                  bg="#3d1a1a", fg=self.RED,
+                  font=("Segoe UI", 9, "bold"), relief="flat",
+                  cursor="hand2", padx=14, pady=5).pack(side="left")
+
+        tk.Label(w, text=f"Auto-denies in {self.TIMEOUT}s with no response.",
+                 bg=self.BG, fg="#444444",
+                 font=("Segoe UI", 7, "italic")).pack(pady=(8, 0))
+        w.grab_set()
+
+    def _allow(self):
+        self._result = True
+        if self._win:
+            self._win.destroy()
+        self._event.set()
+
+    def _deny(self):
+        self._result = False
+        if self._win:
+            self._win.destroy()
+        self._event.set()
+
+
+def _classify_click(x: int, y: int, scope: list | None = None) -> str:
+    """Classify a screen coordinate for action sandboxing.
+
+    Returns:
+      'blocked'          — taskbar / start bar (hard off-limits, always)
+      'needs_permission' — bare desktop, icons, shell views, or out-of-scope windows
+      'allowed'          — matches a user-registered scope window (or no scope set)
+    """
+    try:
+        import win32gui
+        import win32con
+        hwnd = win32gui.WindowFromPoint((x, y))
+        if not hwnd:
+            return "needs_permission"
+        root  = win32gui.GetAncestor(hwnd, win32con.GA_ROOT) or hwnd
+        cls   = win32gui.GetClassName(root)
+        title = win32gui.GetWindowText(root)
+        if cls in _TASKBAR_CLASSES:
+            return "blocked"
+        if cls in _DESKTOP_CLASSES:
+            return "needs_permission"
+        # Scope list populated → only registered windows are autonomous
+        if scope:
+            for entry in scope:
+                if entry.get("class") == cls:
+                    return "allowed"
+                stored = entry.get("title", "").lower()
+                if stored and stored in title.lower():
+                    return "allowed"
+            return "needs_permission"
+        # No scope configured → any app window is allowed (original behaviour)
+        return "allowed"
+    except Exception:
+        return "needs_permission"
 
 
 # ── Agent 4 floating window ──────────────────────────────────────────────────
@@ -189,8 +381,19 @@ class Agent4Window:
         self._conversation: list[dict] = []
         self._vision_region: tuple | None = None
         self._last_response: str = ""
+        self._pending_screenshot: "Image.Image | None" = None
         self._busy = False
+        self._perm_gate = _PermissionGate(self.app.root)
 
+        # Scope: windows agent4 may click autonomously
+        _base = Path(getattr(plugin.app, "BASE_DIR",
+                              Path(__file__).resolve().parent.parent))
+        self._scope_file: Path = _base / "agent4_scope.json"
+        self._scope: list[dict] = []
+        self._scope_visible = False   # collapsible panel state
+        self._scope_list_frame: tk.Frame | None = None
+
+        self._load_scope()
         self._build_ui()
 
     # ── UI ────────────────────────────────────────────────────────────────────
@@ -264,6 +467,42 @@ class Agent4Window:
             bg=self.BG2, fg="#666666", font=("Segoe UI", 8), relief="flat",
             cursor="hand2", padx=4, pady=1
         ).pack(side="left", padx=(3, 0))
+
+        # ── Autonomous scope panel (collapsible) ──────────────────────────────
+        scope_outer = tk.Frame(W, bg=self.BG2)
+        scope_outer.pack(fill="x", padx=6, pady=(4, 0))
+
+        scope_hdr = tk.Frame(scope_outer, bg=self.BG2)
+        scope_hdr.pack(fill="x")
+        self._scope_toggle = tk.Label(
+            scope_hdr, text="▶ Autonomous Scope",
+            bg=self.BG2, fg=self.ORANGE,
+            font=("Segoe UI", 8, "bold"), cursor="hand2")
+        self._scope_toggle.pack(side="left", padx=(6, 0), pady=2)
+        self._scope_count_lbl = tk.Label(
+            scope_hdr, text="(unconfigured — all app windows allowed)",
+            bg=self.BG2, fg="#555555", font=("Segoe UI", 7, "italic"))
+        self._scope_count_lbl.pack(side="left", padx=(4, 0))
+        tk.Button(
+            scope_hdr, text="+ Add Window",
+            command=self._add_scope_window,
+            bg=self.BG2, fg=self.GREEN,
+            font=("Segoe UI", 8), relief="flat",
+            cursor="hand2", padx=5, pady=1
+        ).pack(side="right", padx=(0, 4))
+
+        self._scope_body = tk.Frame(scope_outer, bg=self.BG2)
+        # body starts hidden; toggled by header click
+        self._scope_countdown_lbl = tk.Label(
+            self._scope_body, text="",
+            bg=self.BG2, fg=self.YELLOW,
+            font=("Segoe UI", 8, "italic"))
+        self._scope_countdown_lbl.pack(fill="x", padx=6, pady=(0, 2))
+        self._scope_list_frame = tk.Frame(self._scope_body, bg=self.BG2)
+        self._scope_list_frame.pack(fill="x", padx=6, pady=(0, 4))
+
+        self._scope_toggle.bind("<Button-1>", lambda e: self._toggle_scope_panel())
+        self._refresh_scope_list()
 
         input_frame = tk.Frame(W, bg=self.BG, pady=4)
         input_frame.pack(fill="x", padx=6, pady=(2, 6))
@@ -380,6 +619,170 @@ class Agent4Window:
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"].strip()
 
+    # ── Action executor ───────────────────────────────────────────────────────
+    def _execute_actions(self, block: str) -> list[str]:
+        """Parse and execute one To Actions block. Returns list of completed steps.
+        Runs on the background _send thread — never call from the Tk main thread.
+
+        Sandbox rules enforced here:
+          - Taskbar / start bar coordinates are hard-blocked, action skipped + logged.
+          - Desktop coordinates (icons, shell views) require explicit user approval
+            via _PermissionGate before the click proceeds.
+          - REASON(...) lines set the explanation shown in the permission dialog.
+        """
+        if not _PYAUTOGUI_OK:
+            self._append_history("err", "action execution unavailable — pyautogui not installed")
+            return []
+
+        sw, sh     = _pag.size()
+        executed:  list[str] = []
+        cur_reason = "No reason provided."
+
+        def _clamp(v, lo, hi):
+            return max(lo, min(v, hi))
+
+        def _gate_click(x: int, y: int, label: str) -> bool:
+            """Return True if the click is allowed to proceed."""
+            scope = _classify_click(x, y, self._scope if self._scope else None)
+            if scope == "blocked":
+                msg = f"BLOCKED — taskbar/start bar is off-limits: {label}"
+                self._append_history("err", msg)
+                try:
+                    self.app._log(f"[agent4] {msg}")
+                except Exception:
+                    pass
+                return False
+            if scope == "needs_permission":
+                granted = self._perm_gate.ask(
+                    action_desc=label,
+                    reason=cur_reason,
+                )
+                if not granted:
+                    msg = f"DENIED by user: {label}"
+                    self._append_history("system", msg)
+                    try:
+                        self.app._log(f"[agent4] {msg}")
+                    except Exception:
+                        pass
+                    return False
+            return True
+
+        for raw in block.strip().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            # REASON — sets context for the next permission dialog
+            m = _ACT_REASON_RE.match(line)
+            if m:
+                cur_reason = m.group(1).strip()
+                continue
+
+            m = _ACT_CLICK_RE.match(line)
+            if m:
+                x, y = _clamp(int(m.group(1)), 0, sw-1), _clamp(int(m.group(2)), 0, sh-1)
+                if _gate_click(x, y, f"CLICK({x}, {y})"):
+                    _pag.click(x, y)
+                    executed.append(f"CLICK({x},{y})")
+                    time.sleep(0.15)
+                continue
+
+            m = _ACT_RCLICK_RE.match(line)
+            if m:
+                x, y = _clamp(int(m.group(1)), 0, sw-1), _clamp(int(m.group(2)), 0, sh-1)
+                if _gate_click(x, y, f"RCLICK({x}, {y})"):
+                    _pag.rightClick(x, y)
+                    executed.append(f"RCLICK({x},{y})")
+                    time.sleep(0.15)
+                continue
+
+            m = _ACT_MOVE_RE.match(line)
+            if m:
+                x, y = _clamp(int(m.group(1)), 0, sw-1), _clamp(int(m.group(2)), 0, sh-1)
+                _pag.moveTo(x, y)
+                executed.append(f"MOVE({x},{y})")
+                time.sleep(0.1)
+                continue
+
+            m = _ACT_TYPE_RE.match(line)
+            if m:
+                text = m.group(1).strip().strip('"\'')
+                _pag.write(text, interval=0.03)
+                executed.append(f"TYPE({text!r})")
+                continue
+
+            m = _ACT_HOTKEY_RE.match(line)
+            if m:
+                keys = [k.strip() for k in m.group(1).split(",")]
+                _pag.hotkey(*keys)
+                executed.append(f"HOTKEY({'+'.join(keys)})")
+                time.sleep(0.1)
+                continue
+
+            m = _ACT_SCDN_RE.match(line)
+            if m:
+                n = int(m.group(1))
+                if m.group(2) and m.group(3):
+                    x, y = _clamp(int(m.group(2)), 0, sw-1), _clamp(int(m.group(3)), 0, sh-1)
+                    _pag.scroll(-n, x=x, y=y)
+                    executed.append(f"SCROLL_DOWN({n},{x},{y})")
+                else:
+                    _pag.scroll(-n)
+                    executed.append(f"SCROLL_DOWN({n})")
+                time.sleep(0.1)
+                continue
+
+            m = _ACT_SCUP_RE.match(line)
+            if m:
+                n = int(m.group(1))
+                if m.group(2) and m.group(3):
+                    x, y = _clamp(int(m.group(2)), 0, sw-1), _clamp(int(m.group(3)), 0, sh-1)
+                    _pag.scroll(n, x=x, y=y)
+                    executed.append(f"SCROLL_UP({n},{x},{y})")
+                else:
+                    _pag.scroll(n)
+                    executed.append(f"SCROLL_UP({n})")
+                time.sleep(0.1)
+                continue
+
+            m = _ACT_WAIT_RE.match(line)
+            if m:
+                secs = min(float(m.group(1)), 10.0)
+                time.sleep(secs)
+                executed.append(f"WAIT({secs})")
+                continue
+
+            if _ACT_SHOT_RE.match(line):
+                try:
+                    self._pending_screenshot = _grab_full_or_region(self._vision_region)
+                    executed.append("SCREENSHOT()")
+                except Exception as se:
+                    self._append_history("err", f"screenshot failed: {se}")
+                continue
+
+            try:
+                self.app._log(f"[agent4] unknown action line: {line!r}")
+            except Exception:
+                pass
+
+        return executed
+
+    # ── Vision query (headless, synchronous) ──────────────────────────────────
+    def query_vision(self, prompt: str, region: tuple | None = None,
+                     attach_screenshot: bool = True) -> str:
+        """Blocking vision query — callable by other SOCU components.
+        Returns the raw VLM response string, or an error message prefixed 'ERROR:'."""
+        img = None
+        if attach_screenshot:
+            try:
+                img = _grab_full_or_region(region or self._vision_region)
+            except Exception as e:
+                return f"ERROR: screenshot failed — {e}"
+        try:
+            return self._call_vlm(prompt, img)
+        except Exception as e:
+            return f"ERROR: {e}"
+
     # ── Send ──────────────────────────────────────────────────────────────────
     def _on_send(self, vision: bool = True):
         prompt = self._input.get("1.0", "end").strip()
@@ -412,8 +815,7 @@ class Agent4Window:
             "content": prompt + (" [screenshot attached]" if img else ""),
         })
 
-        import time as _t
-        t0 = _t.time()
+        t0 = time.time()
         try:
             response = self._call_vlm(prompt, img)
         except Exception as e:
@@ -422,11 +824,11 @@ class Agent4Window:
             self.plugin.logger.log(
                 "agent4", prompt, "", img, "error",
                 outcome="fail",
-                inference_ms=(_t.time() - t0) * 1000.0,
+                inference_ms=(time.time() - t0) * 1000.0,
                 extra={"exception": str(e)})
             self._busy = False
             return
-        inference_ms = (_t.time() - t0) * 1000.0
+        inference_ms = (time.time() - t0) * 1000.0
 
         self._last_response = response
         self._conversation.append({"role": "assistant", "content": response})
@@ -434,11 +836,65 @@ class Agent4Window:
         self._set_status("● idle", "#555555")
         self._busy = False
 
-        action = "mission" if source_agent else "chat"
+        action_type = "mission" if source_agent else "chat"
         self.plugin.logger.log(
-            "agent4", prompt, response, img, action,
+            "agent4", prompt, response, img, action_type,
             inference_ms=inference_ms)
 
+        # ── Execute any action blocks first ───────────────────────────────────
+        act_match = _ACT_BLOCK_RE.search(response)
+        if act_match:
+            self._set_status("● acting…", self.ORANGE)
+            try:
+                steps = self._execute_actions(act_match.group(1))
+                if steps:
+                    summary = " → ".join(steps)
+                    self._append_history("system", f"⚡ {len(steps)} action(s): {summary}")
+                    try:
+                        self.app._log(f"[agent4] actions executed: {steps}")
+                    except Exception:
+                        pass
+                    self.plugin.logger.log(
+                        "agent4", prompt, response, img, "actions",
+                        outcome="success", inference_ms=inference_ms,
+                        extra={"steps": steps})
+            except Exception as ae:
+                self._append_history("err", f"action error: {ae}")
+                try:
+                    self.app._log(f"[agent4] action execution error: {ae}")
+                except Exception:
+                    pass
+
+            # If SCREENSHOT() was called during the action block, do a follow-up
+            # observation pass so the model can see what changed after its actions.
+            if self._pending_screenshot is not None:
+                follow_img = self._pending_screenshot
+                self._pending_screenshot = None
+                self._set_status("● observing…", self.ACCENT)
+                try:
+                    obs_response = self._call_vlm(
+                        "You just executed a set of actions. Observe the current screen "
+                        "and report what changed. Route findings or issue further actions as needed.",
+                        follow_img)
+                    self._last_response = obs_response
+                    self._conversation.append({"role": "assistant", "content": obs_response})
+                    self._append_history("agent4", f"[post-action] {obs_response}")
+                    self.plugin.logger.log(
+                        "agent4", "[post-action observation]", obs_response,
+                        follow_img, "observation", inference_ms=0.0)
+                    if auto_route:
+                        obs_m = re.search(
+                            r"(?i)\bto\s+agent\s*([1-4])\b(.+?)end\s+message\s+now",
+                            obs_response, re.DOTALL)
+                        if obs_m and obs_m.group(1) != "4":
+                            self._route_last_to(
+                                f"agent{obs_m.group(1)}", body=obs_m.group(2).strip())
+                except Exception as oe:
+                    self._append_history("err", f"post-action observation error: {oe}")
+
+            self._set_status("● idle", "#555555")
+
+        # ── Auto-route any routing block ──────────────────────────────────────
         if auto_route:
             m = re.search(
                 r"(?i)\bto\s+agent\s*([1-4])\b(.+?)end\s+message\s+now",
@@ -502,6 +958,121 @@ class Agent4Window:
         self._conversation.clear()
         self._last_response = ""
         self._append_history("system", "history cleared")
+
+    # ── Scope: load / save ────────────────────────────────────────────────────
+    def _load_scope(self):
+        try:
+            if self._scope_file.exists():
+                self._scope = _json.loads(self._scope_file.read_text(encoding="utf-8"))
+        except Exception:
+            self._scope = []
+
+    def _save_scope(self):
+        try:
+            self._scope_file.write_text(
+                _json.dumps(self._scope, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    # ── Scope: UI helpers ─────────────────────────────────────────────────────
+    def _toggle_scope_panel(self):
+        self._scope_visible = not self._scope_visible
+        if self._scope_visible:
+            self._scope_body.pack(fill="x")
+            self._scope_toggle.config(text="▼ Autonomous Scope")
+        else:
+            self._scope_body.pack_forget()
+            self._scope_toggle.config(text="▶ Autonomous Scope")
+
+    def _refresh_scope_list(self):
+        if self._scope_list_frame is None:
+            return
+        for w in self._scope_list_frame.winfo_children():
+            w.destroy()
+        if not self._scope:
+            self._scope_count_lbl.config(
+                text="(unconfigured — all app windows allowed)", fg="#555555")
+            return
+        n = len(self._scope)
+        self._scope_count_lbl.config(
+            text=f"({n} window{'s' if n != 1 else ''} — strict mode active)",
+            fg=self.GREEN)
+        for i, entry in enumerate(self._scope):
+            row = tk.Frame(self._scope_list_frame, bg=self.BG2)
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=entry.get("display", entry.get("class", "?")),
+                     bg=self.BG2, fg=self.FG,
+                     font=("Segoe UI", 8), anchor="w").pack(side="left", fill="x", expand=True)
+            tk.Button(row, text="✕",
+                      command=lambda idx=i: self._remove_scope(idx),
+                      bg=self.BG2, fg="#666666",
+                      font=("Segoe UI", 8), relief="flat",
+                      cursor="hand2", padx=4).pack(side="right")
+
+    def _remove_scope(self, idx: int):
+        if 0 <= idx < len(self._scope):
+            removed = self._scope.pop(idx)
+            self._save_scope()
+            self._refresh_scope_list()
+            self._append_history("system", f"scope removed: {removed.get('display', '?')}")
+
+    # ── Scope: calibration ────────────────────────────────────────────────────
+    def _add_scope_window(self):
+        if not self._scope_visible:
+            self._toggle_scope_panel()
+        threading.Thread(target=self._add_scope_thread, daemon=True).start()
+
+    def _add_scope_thread(self):
+        for i in range(3, 0, -1):
+            self._win.after(0, lambda n=i: self._scope_countdown_lbl.config(
+                text=f"Move cursor to target window…  {n}"))
+            time.sleep(1)
+        self._win.after(0, lambda: self._scope_countdown_lbl.config(text=""))
+        try:
+            import win32api, win32gui, win32con
+            x, y = win32api.GetCursorPos()
+            hwnd  = win32gui.WindowFromPoint((x, y))
+            if not hwnd:
+                self._win.after(0, lambda: self._scope_countdown_lbl.config(
+                    text="No window found at cursor position."))
+                return
+            root  = win32gui.GetAncestor(hwnd, win32con.GA_ROOT) or hwnd
+            cls   = win32gui.GetClassName(root)
+            title = win32gui.GetWindowText(root)
+
+            if cls in _TASKBAR_CLASSES or cls in _DESKTOP_CLASSES:
+                self._win.after(0, lambda: self._scope_countdown_lbl.config(
+                    text="Cannot add system shell — point to an app window."))
+                return
+
+            # Don't add the agent4 window itself
+            try:
+                import ctypes
+                own = ctypes.windll.user32.GetParent(int(self._win.wm_frame(), 16))
+                if root == own:
+                    self._win.after(0, lambda: self._scope_countdown_lbl.config(
+                        text="Cannot add this window to its own scope."))
+                    return
+            except Exception:
+                pass
+
+            short = title[:50] + "…" if len(title) > 50 else title
+            display = f"{short}  [{cls}]"
+            entry = {"class": cls, "title": title[:80], "display": display}
+
+            for existing in self._scope:
+                if existing.get("class") == cls and existing.get("title") == entry["title"]:
+                    self._win.after(0, lambda: self._scope_countdown_lbl.config(
+                        text="Already in scope."))
+                    return
+
+            self._scope.append(entry)
+            self._save_scope()
+            self._win.after(0, self._refresh_scope_list)
+            self._append_history("system", f"scope added: {display}")
+        except Exception as e:
+            self._win.after(0, lambda: self._scope_countdown_lbl.config(
+                text=f"Capture error: {e}"))
 
     # ── Region selector ──────────────────────────────────────────────────────
     def _set_region(self):
@@ -569,7 +1140,7 @@ class VPlugin:
     """Container for plugin state attached to SOCU as `socu._vplugin`."""
 
     name = "v_plugin"
-    version = "0.1.0"
+    version = "0.2.0"
 
     def __init__(self, socu_app, config: dict):
         self.app = socu_app
