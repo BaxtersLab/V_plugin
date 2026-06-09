@@ -554,7 +554,7 @@ class Agent4Window:
     def _append_history(self, tag: str, text: str):
         def _do():
             self._history.config(state="normal")
-            prefix = {"user": "You:    ", "agent4": "VLM:    ",
+            prefix = {"user": "User:   ", "agent4": "VLM:    ",
                       "mission": "Mission:", "system": "──────  ",
                       "err": "Error:  "}.get(tag, "        ")
             self._history.insert("end", f"{prefix} {text}\n", tag)
