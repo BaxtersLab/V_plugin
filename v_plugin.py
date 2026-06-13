@@ -91,12 +91,31 @@ _DESKTOP_CLASSES = frozenset({
 
 # ── Defaults (overridable via config) ─────────────────────────────────────────
 DEFAULTS = {
-    "vlm_server_url": "http://localhost:8082/v1/chat/completions",
+    "vlm_server_url": "http://localhost:8080/v1/chat/completions",
     "vlm_model":      "vision",   # llama-server ignores this; matches GGUF Chatbox convention
     "vlm_timeout":    30.0,
-    "vlm_max_tokens": 1024,
+    "vlm_max_tokens": 400,
     "vlm_temperature": 0.3,
 }
+
+# Ordered list of fallback VLM endpoints to probe at startup.
+# Port 8080 = GGUF Chatbox main model proxy (preferred — loads whatever model is in the tray).
+# Port 8082 = standalone vision server (start_vlm_server.py or GGUF Chatbox vision server).
+_FALLBACK_URLS = [
+    "http://localhost:8080/v1/chat/completions",
+    "http://localhost:8082/v1/chat/completions",
+]
+
+
+def _probe_port(port: int) -> bool:
+    """Return True if something is listening on localhost:port (TCP connect, 0.5 s timeout)."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.5)
+    try:
+        return s.connect_ex(("127.0.0.1", port)) == 0
+    finally:
+        s.close()
 
 # Routing system prompt — instructs the VLM how to delegate findings back into
 # the SOC routing protocol. Model-agnostic — works with any instruction-tuned
@@ -137,6 +156,44 @@ AGENT4_SYSTEM_PROMPT = (
     "require special permission but REASON is still good practice.\n"
     "  4. If you are unsure whether a coordinate is safe, use SCREENSHOT() first to "
     "verify what is visible before acting.\n\n"
+
+    "WORKFLOW SEQUENCE — the 4-agent loop you are embedded in:\n"
+    "  Agent 1 (Copilot) → Agent 2 (VS Code Claude Code) → Agent 3 (Claude.ai) → Agent 1\n\n"
+    "  Each agent writes a response in the format:\n"
+    "    To Agent<N>\n"
+    "    [message body]\n"
+    "    end message now\n"
+    "  SOC reads the response via OCR or clipboard, routes it to the next agent.\n\n"
+
+    "STALL RECOVERY — when SOC cannot complete a step it dispatches you with a stall name.\n"
+    "Always SCREENSHOT() first to see the current screen state, then act.\n\n"
+
+    "  copy_button (agent2 — VS Code / Claude Code panel):\n"
+    "    The copy button is a small clipboard or overlapping-pages icon that appears\n"
+    "    on hover at the bottom-right corner of the last AI response block.\n"
+    "    Action: hover over the bottom portion of the response text to reveal the icon,\n"
+    "    then CLICK it. The response text will be copied to the clipboard.\n\n"
+
+    "  clipboard_empty (agent1 — Copilot in Edge/Chrome browser):\n"
+    "    A click was attempted but clipboard is still empty. The copy icon\n"
+    "    appears near the 'end message now' sentinel at the bottom of the response.\n"
+    "    It looks like a clipboard or two overlapping document pages.\n"
+    "    Action: MOVE to the bottom of the Copilot response area, wait for hover-reveal,\n"
+    "    then CLICK the copy icon precisely. If not visible, try a small hover sweep\n"
+    "    across the bottom 60px of the response.\n\n"
+
+    "  send_button (any agent):\n"
+    "    Text was pasted into the agent input box but the send button was not found.\n"
+    "    For Copilot (Edge): a blue filled circle with a right-pointing arrow, appears\n"
+    "    at the right end of the input bar after text is entered.\n"
+    "    For Claude Code (VS Code): a paper-plane or arrow icon at the right of the input.\n"
+    "    For Claude.ai: an upward-arrow button at the right of the input field.\n"
+    "    Action: locate the send button and CLICK it. If unsure, SCREENSHOT() first.\n\n"
+
+    "After completing a stall recovery action, route a brief status:\n"
+    "  To Agent2\n"
+    "  stall resolved: <stall_name> on <agent_id>\n"
+    "  end message now\n\n"
 
     "Action and routing blocks can both appear in a single response — "
     "actions execute first, then the routing block is dispatched.\n\n"
@@ -571,6 +628,25 @@ class Agent4Window:
     def _grab_screen(self) -> Image.Image:
         return _grab_full_or_region(self._vision_region)
 
+    # ── Response sanitizer ────────────────────────────────────────────────────
+    @staticmethod
+    def _sanitize_response(text: str) -> str:
+        """Truncate runaway repetition loops.
+        GGUF models sometimes lock into repeating a line indefinitely.
+        Keep at most 2 occurrences of any single non-empty line, then stop."""
+        lines = text.split("\n")
+        seen: dict[str, int] = {}
+        out: list[str] = []
+        for line in lines:
+            key = line.strip()
+            if key:
+                count = seen.get(key, 0) + 1
+                seen[key] = count
+                if count > 2:
+                    break
+            out.append(line)
+        return "\n".join(out)
+
     # ── VLM call ──────────────────────────────────────────────────────────────
     def _call_vlm(self, prompt: str, image: Image.Image | None = None) -> str:
         """POST prompt (+ optional screenshot) to llama-server. Returns response text."""
@@ -588,10 +664,11 @@ class Agent4Window:
         messages.append({"role": "user", "content": user_content})
 
         payload = {
-            "model":       self.plugin.cfg["vlm_model"],
-            "messages":    messages,
-            "max_tokens":  int(self.plugin.cfg["vlm_max_tokens"]),
-            "temperature": float(self.plugin.cfg["vlm_temperature"]),
+            "model":         self.plugin.cfg["vlm_model"],
+            "messages":      messages,
+            "max_tokens":    int(self.plugin.cfg["vlm_max_tokens"]),
+            "temperature":   float(self.plugin.cfg["vlm_temperature"]),
+            "repeat_penalty": float(self.plugin.cfg.get("vlm_repeat_penalty", 1.3)),
         }
         try:
             resp = requests.post(
@@ -830,6 +907,10 @@ class Agent4Window:
             return
         inference_ms = (time.time() - t0) * 1000.0
 
+        # Sanitize repetition loops — GGUF models can lock into repeating the
+        # same line indefinitely. Truncate at the third occurrence of any line.
+        response = self._sanitize_response(response)
+
         self._last_response = response
         self._conversation.append({"role": "assistant", "content": response})
         self._append_history("agent4", response)
@@ -913,9 +994,10 @@ class Agent4Window:
                     self._route_last_to(target, body=body)
 
     # ── Routing ───────────────────────────────────────────────────────────────
-    def receive_mission(self, mission: str, source_agent: str):
+    def receive_mission(self, mission: str, source_agent: str, silent: bool = False):
         """Called by SOC routing when a message is addressed 'To Agent4'."""
-        self.show()
+        if not silent:
+            self.show()
         self._append_history("system",
             f"── mission received from {source_agent} ──")
         threading.Thread(
@@ -1149,6 +1231,11 @@ class VPlugin:
         for k, v in (config or {}).items():
             if k in DEFAULTS and v is not None:
                 self.cfg[k] = v
+        # Resolve the best available VLM endpoint at startup.
+        # If the saved/configured URL's port isn't listening, try fallback ports
+        # so that loading Phi-4 in the GGUF Chatbox main model tray (port 8080)
+        # is detected automatically without requiring the standalone vision server.
+        self.cfg["vlm_server_url"] = self._resolve_vlm_url()
         base = Path(getattr(socu_app, "BASE_DIR", Path(__file__).resolve().parent.parent))
         if not isinstance(base, Path):
             base = Path(base)
@@ -1162,10 +1249,47 @@ class VPlugin:
         except Exception:
             pass
 
-    def route_to_agent4(self, body: str, source_agent: str | None = None) -> bool:
+    def _resolve_vlm_url(self) -> str:
+        """Return the best reachable VLM endpoint.
+
+        Probes the configured URL first, then the ordered fallback list.
+        Falls back to the configured URL unchanged if nothing responds —
+        the lazy-connection error at inference time will guide the user.
+        """
+        from urllib.parse import urlparse
+        configured = self.cfg["vlm_server_url"]
+        try:
+            configured_port = urlparse(configured).port or 8080
+        except Exception:
+            configured_port = 8080
+
+        if _probe_port(configured_port):
+            return configured
+
+        for url in _FALLBACK_URLS:
+            try:
+                port = urlparse(url).port or 8080
+            except Exception:
+                continue
+            if port == configured_port:
+                continue
+            if _probe_port(port):
+                try:
+                    self.app._log(
+                        f"[v_plugin] port {configured_port} offline — "
+                        f"auto-selected {url}")
+                except Exception:
+                    pass
+                return url
+
+        return configured
+
+    def route_to_agent4(self, body: str, source_agent: str | None = None,
+                        silent: bool = False) -> bool:
         """Called by SOCU's _route_text when destination digit == '4'."""
         try:
-            self.agent4_window.receive_mission(body, source_agent or "unknown")
+            self.agent4_window.receive_mission(body, source_agent or "unknown",
+                                               silent=silent)
             return True
         except Exception as e:
             try:
@@ -1173,6 +1297,39 @@ class VPlugin:
             except Exception:
                 pass
             return False
+
+    def nudge_stall(self, stall_name: str, agent_id: str, context: str = "") -> bool:
+        """Dispatch Agent 4 to visually recover a stalled workflow step.
+
+        stall_name: short label matching one of the STALL RECOVERY entries in the
+                    system prompt (e.g. 'copy_button', 'clipboard_empty', 'send_button').
+        agent_id:   which agent stalled (e.g. 'agent1', 'agent2').
+        context:    optional extra detail about what was on screen / what was tried.
+        Returns True if the dispatch succeeded (Agent 4 loaded and not busy).
+        """
+        win = getattr(self, "agent4_window", None)
+        if win is None:
+            return False
+        if getattr(win, "_busy", False):
+            try:
+                self.app._log(
+                    f"[v_plugin] nudge_stall({stall_name}) skipped — Agent4 already busy")
+            except Exception:
+                pass
+            return False
+        mission = (
+            f"STALL: {stall_name} on {agent_id}\n\n"
+            f"{context}\n\n"
+            "Take a SCREENSHOT() to see the current screen state, identify the "
+            "element described above, then perform the action to unblock the sequence."
+        )
+        try:
+            self.app._log(
+                f"[v_plugin] nudge_stall({stall_name}, {agent_id}) — dispatching Agent4")
+        except Exception:
+            pass
+        return self.route_to_agent4(mission, source_agent="soc_stall_handler",
+                                    silent=True)
 
     def toggle_window(self):
         self.agent4_window.toggle()
