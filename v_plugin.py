@@ -430,7 +430,10 @@ class Agent4Window:
         self._win = tk.Toplevel(parent)
         self._win.title("Agent 4 · Vision")
         self._win.configure(bg=self.BG)
-        self._win.geometry("520x580")
+        self._win.geometry("500x460")
+        # Floor the size so the history can never squeeze the input/send row out of
+        # view — below this the window simply won't shrink further.
+        self._win.minsize(380, 420)
         self._win.attributes("-topmost", True)
         self._win.protocol("WM_DELETE_WINDOW", self.hide)
         self._win.withdraw()
@@ -470,7 +473,7 @@ class Agent4Window:
         hist_frame.pack(fill="both", expand=True, padx=6, pady=(4, 0))
         self._history = scrolledtext.ScrolledText(
             hist_frame, bg=self.BG, fg=self.FG,
-            font=("Consolas", 9), wrap="word",
+            font=("Consolas", 9), wrap="word", height=8,
             relief="flat", state="disabled",
             insertbackground=self.FG)
         self._history.pack(fill="both", expand=True)
@@ -617,9 +620,28 @@ class Agent4Window:
                       "mission": "Mission:", "system": "──────  ",
                       "err": "Error:  "}.get(tag, "        ")
             self._history.insert("end", f"{prefix} {text}\n", tag)
+            # Per-response one-click copy for VLM answers — grab any response without
+            # hand-selecting the read-only history.
+            if tag == "agent4" and text.strip():
+                self._copy_seq = getattr(self, "_copy_seq", 0) + 1
+                ctag = f"copybtn_{self._copy_seq}"
+                self._history.insert("end", "         📋 copy\n", (ctag, "copylink"))
+                self._history.tag_config("copylink", foreground=self.ACCENT, underline=True)
+                self._history.tag_bind(ctag, "<Button-1>", lambda e, t=text: self._copy_text(t))
+                self._history.tag_bind(ctag, "<Enter>", lambda e: self._history.config(cursor="hand2"))
+                self._history.tag_bind(ctag, "<Leave>", lambda e: self._history.config(cursor=""))
             self._history.config(state="disabled")
             self._history.see("end")
         self._win.after(0, _do)
+
+    def _copy_text(self, text: str):
+        """Copy one specific response to the clipboard (per-response copy link)."""
+        try:
+            pyperclip.copy(text)
+            self._set_status("● copied ✓", self.GREEN)
+            self._win.after(1200, lambda: self._set_status("● idle", "#555555"))
+        except Exception:
+            pass
 
     def _set_status(self, text: str, color: str | None = None):
         def _do():
