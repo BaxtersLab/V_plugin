@@ -567,25 +567,27 @@ class Agent4Window:
             input_frame, bg=self.BG2, fg=self.FG,
             font=("Segoe UI", 9), height=3, relief="flat", wrap="word",
             insertbackground=self.FG)
-        self._input.pack(side="left", fill="x", expand=True)
+        self._input.pack(fill="x", expand=True)
         self._input.bind("<Control-Return>", lambda e: self._on_send(vision=True))
         self._input.bind("<Shift-Return>",   lambda e: self._on_send(vision=False))
-        btn_col = tk.Frame(input_frame, bg=self.BG)
-        btn_col.pack(side="left", padx=(4, 0))
+        # Send buttons on their own full-width row so neither label is clipped.
+        # Left (green, 👁) = send WITH a live screenshot (vision); right = text only.
+        btn_row = tk.Frame(input_frame, bg=self.BG)
+        btn_row.pack(fill="x", pady=(4, 0))
         tk.Button(
-            btn_col, text="Send 👁",
+            btn_row, text="👁  Send + Screenshot",
             command=lambda: self._on_send(vision=True),
             bg=self.BG2, fg=self.GREEN,
             font=("Segoe UI", 9, "bold"), relief="flat",
-            cursor="hand2", padx=8, pady=4
-        ).pack(fill="x")
+            cursor="hand2", pady=5
+        ).pack(side="left", fill="x", expand=True, padx=(0, 3))
         tk.Button(
-            btn_col, text="Send",
+            btn_row, text="Send (text only)",
             command=lambda: self._on_send(vision=False),
             bg=self.BG2, fg=self.FG,
-            font=("Segoe UI", 8), relief="flat",
-            cursor="hand2", padx=8, pady=2
-        ).pack(fill="x", pady=(3, 0))
+            font=("Segoe UI", 9), relief="flat",
+            cursor="hand2", pady=5
+        ).pack(side="left", fill="x", expand=True, padx=(3, 0))
 
         self._append_history(
             "system",
@@ -887,10 +889,10 @@ class Agent4Window:
         tag = "mission" if source_agent else "user"
         label = f"[from {source_agent}] " if source_agent else ""
         self._append_history(tag, f"{label}{prompt}" + (" 📷" if img else ""))
-        self._conversation.append({
-            "role": "user",
-            "content": prompt + (" [screenshot attached]" if img else ""),
-        })
+        # The current user turn is recorded AFTER a successful call (below), NOT
+        # here: _call_vlm already appends the current prompt as a user turn, so
+        # adding it here too created TWO consecutive user turns — which strict chat
+        # templates (gemma) reject with HTTP 400 "roles must alternate user/assistant".
 
         t0 = time.time()
         try:
@@ -912,6 +914,13 @@ class Agent4Window:
         response = self._sanitize_response(response)
 
         self._last_response = response
+        # Record the turn only now that it succeeded — user first, then assistant,
+        # preserving strict user/assistant alternation for the next call. History
+        # keeps the text form; the screenshot itself is not stored.
+        self._conversation.append({
+            "role": "user",
+            "content": prompt + (" [screenshot attached]" if img else ""),
+        })
         self._conversation.append({"role": "assistant", "content": response})
         self._append_history("agent4", response)
         self._set_status("● idle", "#555555")
