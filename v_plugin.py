@@ -649,6 +649,28 @@ class Agent4Window:
             out.append(line)
         return "\n".join(out)
 
+    @staticmethod
+    def _build_messages(system_prompt, history, user_content):
+        """Assemble chat messages with STRICTLY alternating user/assistant roles.
+        Strict chat templates (e.g. gemma) raise HTTP 400 on ANY two consecutive
+        same-role turns, so consecutive same-role history turns are merged and a
+        stale trailing user turn is dropped before the current user turn is added."""
+        messages = [{"role": "system", "content": system_prompt}]
+        for turn in history:
+            role = turn.get("role")
+            content = turn.get("content", "")
+            if (len(messages) > 1 and messages[-1]["role"] == role
+                    and role in ("user", "assistant")
+                    and isinstance(messages[-1]["content"], str)
+                    and isinstance(content, str)):
+                messages[-1]["content"] += "\n" + content   # merge same-role turn
+            else:
+                messages.append({"role": role, "content": content})
+        if messages[-1]["role"] == "user":     # avoid user,user with the current turn
+            messages.pop()
+        messages.append({"role": "user", "content": user_content})
+        return messages
+
     # ── VLM call ──────────────────────────────────────────────────────────────
     def _call_vlm(self, prompt: str, image: Image.Image | None = None) -> str:
         """POST prompt (+ optional screenshot) to llama-server. Returns response text."""
@@ -660,10 +682,8 @@ class Agent4Window:
             })
         user_content.append({"type": "text", "text": prompt})
 
-        messages = [{"role": "system", "content": AGENT4_SYSTEM_PROMPT}]
-        for turn in self._conversation[-12:]:
-            messages.append({"role": turn["role"], "content": turn["content"]})
-        messages.append({"role": "user", "content": user_content})
+        messages = self._build_messages(
+            AGENT4_SYSTEM_PROMPT, self._conversation[-12:], user_content)
 
         payload = {
             "model":         self.plugin.cfg["vlm_model"],
