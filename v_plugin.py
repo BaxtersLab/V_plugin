@@ -93,8 +93,10 @@ _DESKTOP_CLASSES = frozenset({
 DEFAULTS = {
     "vlm_server_url": "http://localhost:8080/v1/chat/completions",
     "vlm_model":      "vision",   # llama-server ignores this; matches GGUF Chatbox convention
-    "vlm_timeout":    30.0,
-    "vlm_max_tokens": 400,
+    "vlm_timeout":    300.0,   # local reasoning model can think for a while — patient-wait, don't cut it off early
+    "vlm_max_tokens": 4096,    # local = no per-token cost; a reasoning model needs room to think
+                               # THEN answer (400 truncated it mid-thought → empty content). Bounded
+                               # only for sanity; the model stops naturally (finish_reason=stop).
     "vlm_temperature": 0.3,
 }
 
@@ -116,6 +118,34 @@ def _probe_port(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
     finally:
         s.close()
+
+
+def _endpoint_vision_capable(chat_url: str, timeout: float = 2.0) -> bool:
+    """True if this endpoint's /v1/models reports a vision-capable model.
+
+    Lets A4 auto-find the vision model whether it is loaded in the GGUF Chatbox
+    *main* slot (:8080, use_main_for_vision) or a dedicated *vision* port
+    (:8082) — the resolver prefers whichever endpoint actually serves vision,
+    instead of just whichever port happens to be listening.
+    """
+    import json as _json
+    import urllib.request
+    from urllib.parse import urlparse
+    try:
+        p = urlparse(chat_url)
+        models_url = f"{p.scheme or 'http'}://{p.hostname or '127.0.0.1'}:{p.port or 8080}/v1/models"
+        with urllib.request.urlopen(models_url, timeout=timeout) as r:
+            data = _json.load(r)
+    except Exception:
+        return False
+    # Accept both GGUF Chatbox ({"models":[...]}) and OpenAI ({"data":[...]}) shapes.
+    models = data.get("models") or data.get("data") or []
+    for m in models:
+        caps = m.get("capabilities") or []
+        if any(("multimodal" in str(c).lower() or "vision" in str(c).lower())
+               for c in caps):
+            return True
+    return False
 
 # Routing system prompt — instructs the VLM how to delegate findings back into
 # the SOC routing protocol. Model-agnostic — works with any instruction-tuned
@@ -430,10 +460,21 @@ class Agent4Window:
         self._win = tk.Toplevel(parent)
         self._win.title("Agent 4 · Vision")
         self._win.configure(bg=self.BG)
-        self._win.geometry("500x460")
+        # Taskbar/titlebar icon: the yellow "A4V" mark (replaces the default
+        # python icon). Best-effort — a missing asset must never break the plugin.
+        try:
+            _ico = Path(__file__).resolve().parent / "assets" / "a4v_icon.ico"
+            if _ico.exists():
+                self._win.iconbitmap(default=str(_ico))
+        except Exception:
+            pass
+        # Arrive TIGHT: the window opens at its floor width and a height with
+        # ~1/3 of the old transcript pane removed (scroll covers the rest) —
+        # tight arrival makes multi-window screen layout painless.
+        self._win.geometry("380x355")
         # Floor the size so the history can never squeeze the input/send row out of
         # view — below this the window simply won't shrink further.
-        self._win.minsize(380, 420)
+        self._win.minsize(380, 340)
         self._win.attributes("-topmost", True)
         self._win.protocol("WM_DELETE_WINDOW", self.hide)
         self._win.withdraw()
@@ -640,8 +681,8 @@ class Agent4Window:
             pyperclip.copy(text)
             self._set_status("● copied ✓", self.GREEN)
             self._win.after(1200, lambda: self._set_status("● idle", "#555555"))
-        except Exception:
-            pass
+        except Exception as e:
+            self._append_history("err", f"copy failed: {e}")
 
     def _set_status(self, text: str, color: str | None = None):
         def _do():
@@ -693,6 +734,49 @@ class Agent4Window:
         messages.append({"role": "user", "content": user_content})
         return messages
 
+    # ── Inference awareness (graceful-wait) ─────────────────────────────────────
+    def _slots_url(self) -> str:
+        """Derive the llama-server /slots URL from the configured chat endpoint."""
+        from urllib.parse import urlparse
+        p = urlparse(self.plugin.cfg["vlm_server_url"])
+        return f"{p.scheme or 'http'}://{p.hostname or '127.0.0.1'}:{p.port or 8080}/slots"
+
+    @staticmethod
+    def _parse_slots(slots_json) -> tuple[bool, int, int] | None:
+        """(is_processing, prompt_tokens_processed, prompt_tokens) from a /slots
+        payload, or None if unparseable. Pure logic → unit-testable."""
+        try:
+            s = slots_json[0]
+            return (bool(s.get("is_processing")),
+                    int(s.get("n_prompt_tokens_processed") or 0),
+                    int(s.get("n_prompt_tokens") or 0))
+        except Exception:
+            return None
+
+    def _poll_inference_state(self) -> tuple[bool, int, int] | None:
+        """Query /slots once. Returns (is_processing, processed, total) or None."""
+        try:
+            r = requests.get(self._slots_url(), timeout=2)
+            return self._parse_slots(r.json())
+        except Exception:
+            return None
+
+    def _monitor_inference(self, stop_event):
+        """While a (blocking) VLM call runs, poll /slots and surface live progress
+        so the operator SEES the server working — never a frozen 'thinking…'. This
+        is the graceful-wait the operator requires; degrades silently if /slots is
+        unavailable."""
+        while not stop_event.wait(2.0):
+            st = self._poll_inference_state()
+            if st is None:
+                continue
+            busy, done, total = st
+            if busy and total and done < total:
+                self._set_status(f"● inferencing — prefill {int(done * 100 / max(total, 1))}%",
+                                 self.ACCENT)
+            elif busy:
+                self._set_status("● inferencing — generating…", self.ACCENT)
+
     # ── VLM call ──────────────────────────────────────────────────────────────
     def _call_vlm(self, prompt: str, image: Image.Image | None = None) -> str:
         """POST prompt (+ optional screenshot) to llama-server. Returns response text."""
@@ -714,6 +798,12 @@ class Agent4Window:
             "temperature":   float(self.plugin.cfg["vlm_temperature"]),
             "repeat_penalty": float(self.plugin.cfg.get("vlm_repeat_penalty", 1.3)),
         }
+        # Start the inference-awareness monitor so the blocking call below shows
+        # live server progress instead of a frozen status (operator's graceful-wait
+        # requirement). Always stopped in `finally`.
+        _stop_mon = threading.Event()
+        _mon = threading.Thread(target=self._monitor_inference, args=(_stop_mon,), daemon=True)
+        _mon.start()
         try:
             resp = requests.post(
                 self.plugin.cfg["vlm_server_url"],
@@ -731,14 +821,34 @@ class Agent4Window:
                 f"(underlying error: {e.__class__.__name__})"
             ) from e
         except requests.exceptions.Timeout as e:
+            # Graceful: if the server is STILL inferencing, it's slow, not dead —
+            # say so, and don't imply failure. Otherwise report the plain timeout.
+            st = self._poll_inference_state()
+            if st and st[0]:
+                raise RuntimeError(
+                    f"Vision server is STILL inferencing after "
+                    f"{self.plugin.cfg['vlm_timeout']}s — it is working, just slow "
+                    f"(not stalled). Raise vlm_timeout if this recurs."
+                ) from e
             raise RuntimeError(
                 f"Vision server timed out after "
-                f"{self.plugin.cfg['vlm_timeout']}s. The model may be loading "
-                f"or the prompt may be too long. Increase vlm_timeout in "
-                f"config.json if this persists."
+                f"{self.plugin.cfg['vlm_timeout']}s with no active inference. The "
+                f"model may be loading or the prompt may be too long. Increase "
+                f"vlm_timeout in config.json if this persists."
             ) from e
+        finally:
+            _stop_mon.set()
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        data = resp.json()
+        if "choices" not in data:
+            # llama-server returns HTTP 200 with an {"error": {...}} body when it
+            # can't serve the request (e.g. no mmproj loaded → "image input is not
+            # supported"). Surface that message instead of a cryptic KeyError 'choices'.
+            err = data.get("error")
+            emsg = err.get("message") if isinstance(err, dict) else (err or data)
+            raise RuntimeError(
+                f"Vision server returned an error instead of a completion: {emsg}")
+        return data["choices"][0]["message"]["content"].strip()
 
     # ── Action executor ───────────────────────────────────────────────────────
     def _execute_actions(self, block: str) -> list[str]:
@@ -921,6 +1031,14 @@ class Agent4Window:
         self._busy = True
         self._set_status("● thinking…", self.YELLOW)
 
+        # Reset context per ping-pong: each exchange starts fresh. A4 looks at the
+        # screen anew every time, so it needs no memory of prior exchanges — and
+        # carrying them (especially a prior full-screen image) would grow the
+        # prompt until a follow-up action gets truncated. The action/observe loop
+        # WITHIN this exchange still builds context below; it is cleared again on
+        # the next send. (Manual "clear history" also resets it.)
+        self._conversation.clear()
+
         img = None
         if vision:
             try:
@@ -1080,9 +1198,23 @@ class Agent4Window:
         self._append_history("system", f"→ routed to {agent_id}")
 
     def _copy_last(self):
-        if self._last_response:
-            pyperclip.copy(self._last_response)
-            self._append_history("system", "last response copied to clipboard")
+        """Copy the last response — or, when there is none (fresh window,
+        cleared history, failed call), the full window transcript. Never a
+        silent no-op: it fills the clipboard or says why it couldn't."""
+        text = self._last_response
+        label = "last response"
+        if not text:
+            text = self._history.get("1.0", "end").strip()
+            label = "window text"
+        if not text:
+            self._append_history("system", "nothing to copy yet")
+            return
+        try:
+            pyperclip.copy(text)
+            self._append_history("system",
+                                 f"{label} copied to clipboard ({len(text)} chars)")
+        except Exception as e:
+            self._append_history("err", f"copy failed: {e}")
 
     def _clear_history(self):
         self._history.config(state="normal")
@@ -1301,11 +1433,14 @@ class VPlugin:
             pass
 
     def _resolve_vlm_url(self) -> str:
-        """Return the best reachable VLM endpoint.
+        """Return the best reachable VLM endpoint, preferring a vision-capable one.
 
-        Probes the configured URL first, then the ordered fallback list.
-        Falls back to the configured URL unchanged if nothing responds —
-        the lazy-connection error at inference time will guide the user.
+        Order: configured URL first, then the fallback list. A candidate wins if
+        it is listening AND its /v1/models reports a vision model — so A4 finds
+        the model whether it is loaded in the main slot (:8080) or a dedicated
+        vision port (:8082). If nothing reports vision yet (model not loaded),
+        falls back to the first listening port; the lazy error at call time
+        guides the user. Called at load and again when the A4 window is raised.
         """
         from urllib.parse import urlparse
         configured = self.cfg["vlm_server_url"]
@@ -1314,23 +1449,41 @@ class VPlugin:
         except Exception:
             configured_port = 8080
 
-        if _probe_port(configured_port):
-            return configured
-
+        # Ordered, de-duplicated candidates: configured first, then fallbacks.
+        candidates = [configured]
         for url in _FALLBACK_URLS:
+            if url not in candidates:
+                candidates.append(url)
+
+        # 1) Prefer an endpoint that actually serves vision (main OR vision port).
+        for url in candidates:
             try:
                 port = urlparse(url).port or 8080
             except Exception:
                 continue
-            if port == configured_port:
+            if _probe_port(port) and _endpoint_vision_capable(url):
+                if url != configured:
+                    try:
+                        self.app._log(f"[v_plugin] vision model found on {url} — using it")
+                    except Exception:
+                        pass
+                return url
+
+        # 2) None report vision yet — use the first listening port so a later
+        #    model load still works; the lazy connection error will guide setup.
+        for url in candidates:
+            try:
+                port = urlparse(url).port or 8080
+            except Exception:
                 continue
             if _probe_port(port):
-                try:
-                    self.app._log(
-                        f"[v_plugin] port {configured_port} offline — "
-                        f"auto-selected {url}")
-                except Exception:
-                    pass
+                if url != configured:
+                    try:
+                        self.app._log(
+                            f"[v_plugin] no vision endpoint live yet — "
+                            f"auto-selected listening {url}")
+                    except Exception:
+                        pass
                 return url
 
         return configured
@@ -1384,6 +1537,30 @@ class VPlugin:
 
     def toggle_window(self):
         self.agent4_window.toggle()
+
+    def refresh_endpoint(self) -> str:
+        """Re-detect the vision endpoint (main :8080 or dedicated vision :8082)
+        and update cfg. Called when the A4 window is raised (e.g. from the master
+        widget) so a model loaded after startup is picked up without a restart."""
+        url = self._resolve_vlm_url()
+        self.cfg["vlm_server_url"] = url
+        return url
+
+    def show_window(self):
+        """Bring the A4 window to front and re-resolve the endpoint. This is the
+        target of the master widget's 'Show A4' control (via SOC's signal poll)."""
+        try:
+            self.refresh_endpoint()
+        except Exception:
+            pass
+        try:
+            self.agent4_window.show()
+        except Exception:
+            # Fall back to toggle if a dedicated show() isn't available.
+            try:
+                self.agent4_window.toggle()
+            except Exception:
+                pass
 
 
 def load(socu_app, config: dict | None = None) -> VPlugin:
