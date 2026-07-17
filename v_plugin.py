@@ -35,6 +35,17 @@ from tkinter import scrolledtext
 import pyperclip
 from PIL import Image
 
+# Platform seam (S8): window-under-point + cursor queries go through the SOC
+# platform layer (win32 today, X11 on Linux). When run standalone (not via
+# SOC), the SOC root two levels up is added to sys.path to find it.
+try:
+    from platform_layer import get_platform
+except ImportError:
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from platform_layer import get_platform
+PLATFORM = get_platform()
+
 # mss is optional — we fall back to PIL.ImageGrab if not present
 try:
     import mss
@@ -409,14 +420,10 @@ def _classify_click(x: int, y: int, scope: list | None = None) -> str:
       'allowed'          — matches a user-registered scope window (or no scope set)
     """
     try:
-        import win32gui
-        import win32con
-        hwnd = win32gui.WindowFromPoint((x, y))
-        if not hwnd:
+        got = PLATFORM.window_from_point(x, y)
+        if not got:
             return "needs_permission"
-        root  = win32gui.GetAncestor(hwnd, win32con.GA_ROOT) or hwnd
-        cls   = win32gui.GetClassName(root)
-        title = win32gui.GetWindowText(root)
+        _root, title, cls, _rect = got
         if cls in _TASKBAR_CLASSES:
             return "blocked"
         if cls in _DESKTOP_CLASSES:
@@ -1294,23 +1301,22 @@ class Agent4Window:
             time.sleep(1)
         self._win.after(0, lambda: self._scope_countdown_lbl.config(text=""))
         try:
-            import win32api, win32gui, win32con
-            x, y = win32api.GetCursorPos()
-            hwnd  = win32gui.WindowFromPoint((x, y))
-            if not hwnd:
+            x, y = PLATFORM.cursor_pos()
+            got = PLATFORM.window_from_point(x, y)
+            if not got:
                 self._win.after(0, lambda: self._scope_countdown_lbl.config(
                     text="No window found at cursor position."))
                 return
-            root  = win32gui.GetAncestor(hwnd, win32con.GA_ROOT) or hwnd
-            cls   = win32gui.GetClassName(root)
-            title = win32gui.GetWindowText(root)
+            root, title, cls, _rect = got
 
             if cls in _TASKBAR_CLASSES or cls in _DESKTOP_CLASSES:
                 self._win.after(0, lambda: self._scope_countdown_lbl.config(
                     text="Cannot add system shell — point to an app window."))
                 return
 
-            # Don't add the agent4 window itself
+            # Don't add the agent4 window itself. Win32-only best-effort
+            # (ctypes.windll is absent on Linux → AttributeError → skipped);
+            # harmless everywhere, no platform-layer equivalent needed for v1.
             try:
                 import ctypes
                 own = ctypes.windll.user32.GetParent(int(self._win.wm_frame(), 16))
